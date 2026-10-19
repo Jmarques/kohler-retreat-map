@@ -1435,14 +1435,15 @@ const GROUP = (() => {
   const load = () => { try { return JSON.parse(localStorage.getItem(LS) || "{}"); } catch (_) { return {}; } };
   const save = () => { try { localStorage.setItem(LS, JSON.stringify(me)); } catch (_) {} };
   const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  const me = Object.assign({ id: "", name: "", hours: 4, until: 0, welcomed: false, pendingClear: false }, load());
+  const me = Object.assign({ id: "", name: "", mins: 5, until: 0, pendingClear: false }, load());
+  if (![1, 5, 15].includes(me.mins)) me.mins = 5;
   if (!/^[0-9a-f]{12}$/.test(me.id)) { me.id = hex(crypto.getRandomValues(new Uint8Array(6))); save(); }
 
   const qs = new URLSearchParams(location.search);
   const TEST_RELAY = qs.get("relay");
   const RELAYS = TEST_RELAY ? [TEST_RELAY] : ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
   const MQTT_V = TEST_RELAY ? 4 : 5; // public brokers speak MQTT 5 (retained-message expiry); the local test broker only 3.1.1
-  const STALE = 5 * 60e3, GONE = 20 * 60e3;
+  const STALE = 90e3, GONE = 20 * 60e3, GRACE = 5e3;
   const COLORS = ["#7A4E2D", "#3F6B4F", "#2F5D7C", "#8A3B3B", "#5B4A7A", "#6F6224", "#2D6E6E", "#7A4561", "#4C5A2A", "#3B4E7A"];
   const colorOf = (id) => COLORS[parseInt(id.slice(0, 6), 16) % COLORS.length];
   const initials = (n) => {
@@ -1451,12 +1452,13 @@ const GROUP = (() => {
     return w.length > 1 ? (w[0][0] + w[1][0]).toUpperCase() : w[0][0].toUpperCase() + (w[0][1] || "").toLowerCase();
   };
   const ago = (ts) => { const s = (Date.now() - ts) / 1000; return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  const left = () => { const r = Math.max(0, Math.round((me.until - Date.now()) / 1000)); return r >= 60 ? `${Math.floor(r / 60)}:${String(r % 60).padStart(2, "0")}` : `${r} s`; };
   const clock = (ts) => new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   const isStale = (m) => m.paused || Date.now() - m.ts > STALE;
   const svgPeople = (sz) => `<svg style="width:${sz}px;height:${sz}px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3.5 19c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5"/><circle cx="16.8" cy="9.5" r="2.5"/><path d="M15.5 14.2c2.4-.3 4.4 1.2 5 4"/></svg>`;
   const ICON_BACK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 6-6 6 6 6"/></svg>';
 
-  let aesKey = null, base = null, sharing = false, lastSent = null, hb = null, errMsg = "", fixMsg = "", mqttLoaded = false, filter = "";
+  let tick = null, aesKey = null, base = null, sharing = false, lastSent = null, hb = null, errMsg = "", fixMsg = "", mqttLoaded = false, filter = "";
   const clients = [], mates = new Map();
 
   /* ---- crypto: AES-GCM key and topic both derived from the secret in the link ---- */
@@ -1502,14 +1504,14 @@ const GROUP = (() => {
     if (!d || d.id !== id || !isFinite(d.lat) || !isFinite(d.lng) || !isFinite(d.ts) || typeof d.name !== "string") return;
     const m = mates.get(id);
     if (m && m.ts > d.ts) return;
-    if (Date.now() - d.ts > GONE || (d.until && Date.now() > d.until + 60e3)) return removeMate(id);
+    if (Date.now() - d.ts > GONE || (d.until && Date.now() > d.until + GRACE)) return removeMate(id);
     upsert(id, { name: d.name.slice(0, 24), lat: +d.lat, lng: +d.lng, acc: +d.acc || 30, ts: +d.ts, until: +d.until || 0, paused: !!d.paused });
   }
   function send(payload, expirySec) {
     let sent = 0;
     for (const c of clients) if (c.connected) {
       const opts = { qos: 0, retain: true };
-      if (MQTT_V === 5 && expirySec) opts.properties = { messageExpiryInterval: Math.max(60, Math.round(expirySec)) };
+      if (MQTT_V === 5 && expirySec) opts.properties = { messageExpiryInterval: Math.max(30, Math.round(expirySec)) };
       c.publish(base + me.id, payload, opts); sent++;
     }
     return sent;
@@ -1517,11 +1519,11 @@ const GROUP = (() => {
   async function publish(force, paused) {
     if (!sharing || !you || !aesKey) return;
     const now = Date.now();
-    if (!force && lastSent && metres([you.lat, you.lng], [lastSent.lat, lastSent.lng]) < 12 && now - lastSent.ts < 45e3) return;
+    if (!force && lastSent && metres([you.lat, you.lng], [lastSent.lat, lastSent.lng]) < 8 && now - lastSent.ts < 15e3) return;
     lastSent = { lat: you.lat, lng: you.lng, ts: now };
     const body = { v: 1, id: me.id, name: me.name, lat: +you.lat.toFixed(6), lng: +you.lng.toFixed(6), acc: Math.round(you.acc), ts: now, until: me.until };
     if (paused) body.paused = true;
-    send(await seal(body), Math.min((me.until - now) / 1000, GONE / 1000) + 60);
+    send(await seal(body), (me.until - now) / 1000 + 30);
   }
   function clearMine() {
     const n = send(new Uint8Array(0));
@@ -1560,7 +1562,7 @@ const GROUP = (() => {
   function sweep() {
     const now = Date.now();
     for (const m of [...mates.values()]) {
-      if (now - m.ts > GONE || (m.until && now > m.until + 60e3)) removeMate(m.id);
+      if (now - m.ts > GONE || (m.until && now > m.until + GRACE)) removeMate(m.id);
       else if (m.marker) m.marker.getElement().classList.toggle("stale", isStale(m));
     }
     if (sharing && now > me.until) stop(true);
@@ -1637,7 +1639,7 @@ const GROUP = (() => {
   const countText = () => { const { now, earlier } = counts(); return `${now} here now` + (earlier ? ` · ${earlier} earlier` : ""); };
   function sharingUI() {
     $("#btnPeople").classList.toggle("sharing", sharing);
-    if (sharing) { chip.hidden = false; chip.dataset.kind = "share"; chip.innerHTML = `<span class="live-dot"></span>Sharing until ${clock(me.until)}`; }
+    if (sharing) { chip.hidden = false; chip.dataset.kind = "share"; chip.innerHTML = `<span class="live-dot"></span>Sharing · ${left()} left`; }
     else if (chip.dataset.kind === "share") { chip.hidden = true; chip.dataset.kind = ""; }
   }
   function relayUI() {
@@ -1669,7 +1671,7 @@ const GROUP = (() => {
       <div class="g-filter" id="gFilterWrap" hidden><input type="search" id="gFilter" placeholder="Find a colleague" autocomplete="off" aria-label="Find a colleague" value="${esc(filter)}"></div>
       <ul class="mates" id="gList"></ul>
       <details class="g-how"><summary>How sharing works</summary>
-        <p>Your phone encrypts your name and position with a key that's part of this link, then sends them through two free public relays (EMQX and HiveMQ). The relays can see that a phone connected and when, but not who you are or where. Anyone who has this link can see you while you share. Sharing pauses when your screen locks or you leave this page, and stops for good at the time you chose or when you tap Stop.</p>
+        <p>Your phone encrypts your name and position with a key that's part of this link, then sends them through two free public relays (EMQX and HiveMQ). The relays can see that a phone connected and when, but not who you are or where. Nothing is shared until you tap Share my location. While you share, anyone who has this link can see you. Sharing pauses when your screen locks or you leave this page, and stops for good after 1, 5 or 15 minutes, or when you tap Stop.</p>
       </details>`);
     renderMe(); renderRows(only); relayUI();
     $("#gInvite").addEventListener("click", invite);
@@ -1691,11 +1693,11 @@ const GROUP = (() => {
         <div class="g-field"><label for="gName">Your name on the map</label>
           <input type="text" id="gName" maxlength="20" autocomplete="given-name" enterkeyhint="done" placeholder="First name or nickname" value="${esc(me.name)}"${errMsg && !me.name ? ' aria-invalid="true" aria-describedby="gErr"' : ""}></div>
         <div class="g-field"><label id="gDurL">Share for</label>
-          <div class="seg" role="group" aria-labelledby="gDurL">${[2, 4, 8].map((h) => `<button type="button" data-h="${h}" aria-pressed="${me.hours === h}">${h} hours</button>`).join("")}</div></div>
+          <div class="seg" role="group" aria-labelledby="gDurL">${[1, 5, 15].map((n) => `<button type="button" data-m="${n}" aria-pressed="${me.mins === n}">${n} min</button>`).join("")}</div></div>
         ${errMsg ? `<p class="g-err" id="gErr" role="alert">${esc(errMsg)}</p>` : ""}
         <button class="btn primary" type="button" id="gStart">${svgPeople(20)}<span>Share my location</span></button>
-        <p class="g-fine">Anyone with this link will see your name and where you are until the time you choose. Sharing pauses when your screen locks or you leave this page; your last spot stays visible, greyed out, for up to 20 minutes.</p>`;
-      box.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => { me.hours = +b.dataset.h; save(); box.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-pressed", x === b)); }));
+        <p class="g-fine">Sharing is off until you tap the button. While it's on, anyone with this link sees your name and where you are. It pauses if your screen locks or you leave this page, and your dot disappears when the time is up.</p>`;
+      box.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => { me.mins = +b.dataset.m; save(); box.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-pressed", x === b)); }));
       const inp = $("#gName");
       inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } });
       inp.addEventListener("input", () => { if (inp.getAttribute("aria-invalid")) { inp.removeAttribute("aria-invalid"); } });
@@ -1705,7 +1707,7 @@ const GROUP = (() => {
   }
   function patchMe() {
     const s = $("#gMeSub"); if (!s) return;
-    s.textContent = you ? `Until ${clock(me.until)} · while this page is open` : (fixMsg || "Finding your location…");
+    s.textContent = you ? `${left()} left · keep this page open` : (fixMsg || "Finding your location…");
   }
   function rowHTML(m) {
     const stale = isStale(m);
@@ -1789,7 +1791,7 @@ const GROUP = (() => {
   function start() {
     const name = ($("#gName")?.value || "").trim().replace(/\s+/g, " ");
     if (!name) { errMsg = "Add a first name or nickname so people know it's you."; me.name = ""; renderMe(); $("#gName").focus(); return; }
-    errMsg = ""; fixMsg = ""; me.name = name.slice(0, 20); me.until = Date.now() + me.hours * 3600e3; me.pendingClear = false; save();
+    errMsg = ""; fixMsg = ""; me.name = name.slice(0, 20); me.until = Date.now() + me.mins * 60e3; me.pendingClear = false; save();
     sharing = true; lastSent = null;
     $("#gName")?.blur();
     begin();
@@ -1800,15 +1802,16 @@ const GROUP = (() => {
     quietLocErrors = true;
     startWatch(true);
     if (you) publish(true);
-    clearInterval(hb); hb = setInterval(() => publish(true), 60e3);
+    clearInterval(hb); hb = setInterval(() => publish(true), 20e3);
+    clearInterval(tick); tick = setInterval(() => { if (!sharing) return clearInterval(tick); if (Date.now() > me.until) return stop(true); patchMe(); sharingUI(); }, 1000);
     sharingUI();
   }
   function stop(auto) {
-    sharing = false; me.until = 0; save(); clearInterval(hb); lastSent = null; quietLocErrors = false;
+    sharing = false; me.until = 0; save(); clearInterval(hb); clearInterval(tick); lastSent = null; quietLocErrors = false;
     clearMine();
     if ($("#gMe")) renderMe();
     sharingUI(); scheduleRefresh();
-    toast(auto ? "Your sharing time ended. Your dot has been removed." : "You've stopped sharing. Your dot has been removed.");
+    toast(auto ? "Your sharing time is up. Your dot has been removed." : "You've stopped sharing. Your dot has been removed.");
   }
   posHooks.push(() => { if (sharing) { fixMsg = ""; publish(false); } if ($("#gMe") && sharing) patchMe(); });
   errHooks.push((err) => {
@@ -1829,14 +1832,14 @@ const GROUP = (() => {
   /* ---- boot ---- */
   $("#btnPeople").hidden = false;
   $("#btnPeople").addEventListener("click", () => ($("#gList") ? closePlace() : openPeople()));
-  setInterval(sweep, 30e3);
+  setInterval(sweep, 10e3);
   init().then(() => {
     const go = () => { mqttLoaded = true; connect(); relayUI(); };
     if (window.mqtt) go();
     else { const s = document.createElement("script"); s.src = MQTT_SRC; s.onload = go; s.onerror = () => toast("Couldn't load live sharing. Check your connection and reload."); document.head.appendChild(s); }
     if (me.until > Date.now() && me.name) { sharing = true; begin(); }
     else if (me.until) { me.until = 0; save(); }
-    if (!me.welcomed || sharing) { me.welcomed = true; save(); setTimeout(() => openPeople(), 300); }
+    if (sharing) setTimeout(() => openPeople(), 300);
   });
   return { openPeople, openMate, mates, me, clients, start, stop, isSharing: () => sharing, _upsert: upsert };
 })();
